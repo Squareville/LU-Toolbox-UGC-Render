@@ -1,4 +1,9 @@
-# cam_fit.py — camera fitting utilities for LU Toolbox UGC Render
+# cam_fit.py — precision camera fitting (scale-ratio solve)
+# - No rotation/FOV changes
+# - Uses evaluated mesh vertices for tight screen-space bounds
+# - Moves camera in local XY (optional) to center, then along local Z exactly
+# - Does NOT modify clip planes
+
 import math
 import bpy
 import mathutils
@@ -8,8 +13,10 @@ __all__ = [
     "collect_render_objects_from_collection",
 ]
 
+# ---------------------------------------------------------
+# Collect renderable objects
+# ---------------------------------------------------------
 def collect_render_objects_from_collection(col: bpy.types.Collection):
-    """Flatten renderable objects in a collection hierarchy."""
     objs = set()
     def walk(c):
         for o in c.objects:
@@ -18,195 +25,217 @@ def collect_render_objects_from_collection(col: bpy.types.Collection):
         for cc in c.children:
             walk(cc)
     walk(col)
-    return list(objs)
+    return [o for o in objs if _is_render_candidate(o)]
 
-# ------------------ FOV helpers ------------------
+def _is_render_candidate(o: bpy.types.Object):
+    if getattr(o, "hide_render", False):
+        return False
+    if hasattr(o, "visible_get") and not o.visible_get():
+        return False
+    return o.type in {'MESH','CURVE','SURFACE','FONT','META','VOLUME'}
 
-def fov_y_from_camera(cam: bpy.types.Object, render: bpy.types.RenderSettings):
-    cdata = cam.data
-    if cdata.type == 'ORTHO':
-        return None
-
-    sensor_fit = cdata.sensor_fit
-    sensor_width = cdata.sensor_width
-    sensor_height = cdata.sensor_height
-
-    res_x = render.resolution_x * render.resolution_percentage / 100.0
-    res_y = render.resolution_y * render.resolution_percentage / 100.0
-    aspect = res_x / res_y if res_y != 0 else 1.0
-
-    if sensor_fit == 'VERTICAL':
-        return 2.0 * math.atan((sensor_height * 0.5) / cdata.lens)
-    elif sensor_fit == 'HORIZONTAL':
-        fx = 2.0 * math.atan((sensor_width * 0.5) / cdata.lens)
-        half_fx = fx * 0.5
-        half_fy = math.atan(math.tan(half_fx) / aspect)
-        return 2.0 * half_fy
-    else:
-        sensor_ratio = sensor_width / sensor_height if sensor_height != 0 else 1.0
-        if aspect >= sensor_ratio:  # horizontal fit
-            fx = 2.0 * math.atan((sensor_width * 0.5) / cdata.lens)
-            half_fx = fx * 0.5
-            half_fy = math.atan(math.tan(half_fx) / aspect)
-            return 2.0 * half_fy
-        else:  # vertical fit
-            return 2.0 * math.atan((sensor_height * 0.5) / cdata.lens)
-
-def fov_x_from_camera(cam: bpy.types.Object, render: bpy.types.RenderSettings):
-    fy = fov_y_from_camera(cam, render)
-    if fy is None:
-        return None
-    res_x = render.resolution_x * render.resolution_percentage / 100.0
-    res_y = render.resolution_y * render.resolution_percentage / 100.0
-    aspect = res_x / res_y if res_y != 0 else 1.0
-    half_fy = fy * 0.5
-    half_fx = math.atan(math.tan(half_fy) * aspect)
-    return 2.0 * half_fx
-
-# ------------------ Core fit ------------------
-
-def _gather_world_bbox_points(objects):
+# ---------------------------------------------------------
+# Geometry sampling — evaluated mesh verts (tight) + bbox fallback
+# ---------------------------------------------------------
+def _world_points_evaluated(objects, depsgraph):
     pts = []
     for obj in objects:
-        # Must be visible to the camera; you can relax this if needed.
-        if not obj.visible_get():
+        if not _is_render_candidate(obj):
             continue
-        if obj.type in {'MESH','CURVE','SURFACE','FONT','META','VOLUME'}:
-            mw = obj.matrix_world
+        ob_eval = obj.evaluated_get(depsgraph)
+        if ob_eval.type == 'MESH':
+            try:
+                me = ob_eval.to_mesh()
+            except RuntimeError:
+                me = None
+            if me:
+                mw = ob_eval.matrix_world
+                for v in me.vertices:
+                    pts.append(mw @ v.co)
+                ob_eval.to_mesh_clear()
+        else:
             bb = getattr(obj, "bound_box", None)
             if bb:
+                mw = obj.matrix_world
                 for c in bb:
                     pts.append(mw @ mathutils.Vector(c))
     return pts
 
-def _project_to_cam_space(points, cam: bpy.types.Object):
+# ---------------------------------------------------------
+# Camera / math helpers
+# ---------------------------------------------------------
+def _to_cam_space(points, cam: bpy.types.Object):
     M = cam.matrix_world.inverted()
     return [M @ p for p in points]
 
-def _center_in_camera_plane(cam_pts):
-    minx = min(p.x for p in cam_pts)
-    maxx = max(p.x for p in cam_pts)
-    miny = min(p.y for p in cam_pts)
-    maxy = max(p.y for p in cam_pts)
-    cx = (minx + maxx) * 0.5
-    cy = (miny + maxy) * 0.5
-    return cx, cy, minx, maxx, miny, maxy
+def _cam_axes(cam: bpy.types.Object):
+    q = cam.matrix_world.to_quaternion()
+    right = q @ mathutils.Vector((1,0,0))
+    up    = q @ mathutils.Vector((0,1,0))
+    fwd   = -(q @ mathutils.Vector((0,0,1)))  # camera looks along -Z
+    return right, up, fwd
 
+def _fov_y_from_camera(cam: bpy.types.Object, render: bpy.types.RenderSettings):
+    cd = cam.data
+    if cd.type == 'ORTHO':
+        return None
+    sw, sh = cd.sensor_width, cd.sensor_height
+    rx = render.resolution_x * render.resolution_percentage / 100.0
+    ry = render.resolution_y * render.resolution_percentage / 100.0
+    aspect = rx / ry if ry else 1.0
+    fit = cd.sensor_fit
+    if fit == 'VERTICAL':
+        return 2.0 * math.atan((sh * 0.5) / cd.lens)
+    if fit == 'HORIZONTAL':
+        fx = 2.0 * math.atan((sw * 0.5) / cd.lens)
+        return 2.0 * math.atan(math.tan(fx * 0.5) / aspect)
+    # AUTO
+    sratio = sw / sh if sh else 1.0
+    if aspect >= sratio:
+        fx = 2.0 * math.atan((sw * 0.5) / cd.lens)
+        return 2.0 * math.atan(math.tan(fx * 0.5) / aspect)
+    else:
+        return 2.0 * math.atan((sh * 0.5) / cd.lens)
+
+def _fov_x_from_camera(cam: bpy.types.Object, render: bpy.types.RenderSettings):
+    fy = _fov_y_from_camera(cam, render)
+    if fy is None:
+        return None
+    rx = render.resolution_x * render.resolution_percentage / 100.0
+    ry = render.resolution_y * render.resolution_percentage / 100.0
+    aspect = rx / ry if ry else 1.0
+    return 2.0 * math.atan(math.tan(fy * 0.5) * aspect)
+
+# ---------------------------------------------------------
+# Main fit (exact scale solve)
+# ---------------------------------------------------------
 def fit_camera_to_objects(
     cam: bpy.types.Object,
     scene: bpy.types.Scene,
     objects,
     margin: float = 1.02,
-    allow_xy_center: bool = True
+    allow_xy_center: bool = True,
+    debug: bool = False,
 ):
     """
-    Tight-fit camera to 'objects' by adjusting **position only**:
-      - translate in camera-local X/Y (optional) to center the object on screen,
-      - translate along camera-local -Z to fill the frame with minimal headroom,
-      - no rotation or FOV changes.
-    Works for perspective and orthographic cameras.
-
-    'margin' is a multiplier (1.0 = mathematically tight; 1.02 = 2% headroom).
+    Screen-tight fit using scale-ratio solve:
+      1) optional XY centering in camera plane (world-units) to center bbox,
+      2) compute r_i = max(|x|/(d*tanFx), |y|/(d*tanFy)) per point (d = -z),
+      3) r_max = max r_i; target r_target = 1 / margin,
+      4) compute scale s = r_target / r_max. Move camera by a single delta t so depths
+         scale by s (d' = d - t). Using the limiting point depth d*, t = d* * (1 - 1/s).
+    Notes:
+      - Keeps rotation/FOV unchanged
+      - Does NOT modify clip planes
+      - Ignores camera shift_x/shift_y for centering (different unit space)
     """
-    pts_world = _gather_world_bbox_points(objects)
-    if not pts_world:
-        return  # nothing to frame
-
-    cam_pts = _project_to_cam_space(pts_world, cam)
-
-    r = scene.render
-    res_x = r.resolution_x * r.resolution_percentage / 100.0
-    res_y = r.resolution_y * r.resolution_percentage / 100.0
-    aspect = res_x / res_y if res_y else 1.0
-
-    # ---------------- Ortho camera ----------------
-    if cam.data.type == 'ORTHO':
-        cx, cy, minx, maxx, miny, maxy = _center_in_camera_plane(cam_pts)
-
-        # Move camera in local XY so the bbox center is in the view center
-        if allow_xy_center:
-            # Shifting camera by +tx in local X moves points by -tx (camera space)
-            tx, ty = cx, cy
-        else:
-            tx, ty = 0.0, 0.0
-
-        width = (maxx - minx)
-        height = (maxy - miny)
-
-        # Apply margin
-        width *= margin
-        height *= margin
-
-        # Blender ortho camera uses 'ortho_scale' as width in world units.
-        ortho_width_needed = max(width, height * aspect)
-        cam.data.ortho_scale = max(ortho_width_needed, 1e-6)
-
-        # Apply the XY shift to camera location in world space
-        if allow_xy_center and (abs(tx) > 1e-9 or abs(ty) > 1e-9):
-            q = cam.matrix_world.to_quaternion()
-            right = q @ mathutils.Vector((1,0,0))
-            up    = q @ mathutils.Vector((0,1,0))
-            cam.location += right * tx + up * ty
-
-        # Reasonable clip planes
-        extent = max(width, height) * 0.5
-        cam.data.clip_start = 0.001
-        cam.data.clip_end   = max(cam.data.clip_end, extent * 20.0)
+    if not objects:
         return
 
-    # ---------------- Perspective camera ----------------
-    fy = fov_y_from_camera(cam, r) or math.radians(50.0)
-    fx = fov_x_from_camera(cam, r)
-    if fx is None:
-        half_fy = fy * 0.5
-        half_fx = math.atan(math.tan(half_fy) * aspect)
-        fx = 2.0 * half_fx
+    dg = bpy.context.evaluated_depsgraph_get()
+    pts_world = _world_points_evaluated(objects, dg)
+    if not pts_world:
+        return
 
-    half_fx = max(fx * 0.5, 1e-6)
-    half_fy = max(fy * 0.5, 1e-6)
-    tan_fx = math.tan(half_fx)
-    tan_fy = math.tan(half_fy)
+    r = scene.render
+    rx = r.resolution_x * r.resolution_percentage / 100.0
+    ry = r.resolution_y * r.resolution_percentage / 100.0
+    aspect = rx / ry if ry else 1.0
 
-    # Centering: choose tx, ty so that the bbox is centered in camera XY.
-    cx, cy, minx, maxx, miny, maxy = _center_in_camera_plane(cam_pts)
+    cd = cam.data
+
+    # Ortho path: exact via ortho_scale + XY center
+    if cd.type == 'ORTHO':
+        cam_pts = _to_cam_space(pts_world, cam)
+        # center to (0,0) in camera plane
+        minx = min(p.x for p in cam_pts); maxx = max(p.x for p in cam_pts)
+        miny = min(p.y for p in cam_pts); maxy = max(p.y for p in cam_pts)
+        cx = (minx + maxx) * 0.5
+        cy = (miny + maxy) * 0.5
+        if allow_xy_center and (abs(cx) > 1e-9 or abs(cy) > 1e-9):
+            right, up, _ = _cam_axes(cam)
+            cam.location += right * cx + up * cy
+            cam_pts = _to_cam_space(pts_world, cam)
+
+        minx = min(p.x for p in cam_pts); maxx = max(p.x for p in cam_pts)
+        miny = min(p.y for p in cam_pts); maxy = max(p.y for p in cam_pts)
+        width  = (maxx - minx) * margin
+        height = (maxy - miny) * margin
+        cd.ortho_scale = max(width, height * aspect, 1e-6)
+
+        if debug:
+            print(f"[UGC Fit ORTHO] width={width:.4f}, height={height:.4f}, scale={cd.ortho_scale:.4f}")
+        return
+
+    # Perspective path:
+    fy = _fov_y_from_camera(cam, r) or math.radians(50.0)
+    fx = _fov_x_from_camera(cam, r) or 2.0 * math.atan(math.tan(fy * 0.5) * aspect)
+    tanFx = max(math.tan(fx * 0.5), 1e-9)
+    tanFy = max(math.tan(fy * 0.5), 1e-9)
+
+    # Initial projection
+    cam_pts = _to_cam_space(pts_world, cam)
+
+    # Ensure everything is in front of camera by epsilon
+    depths = [-p.z for p in cam_pts]
+    d_min = min(depths)
+    eps = 1e-4
+    if d_min <= eps:
+        # Move camera back just enough so nearest point is at eps
+        _, _, fwd = _cam_axes(cam)
+        cam.location += (-fwd) * (eps - d_min + 1e-4)
+        cam_pts = _to_cam_space(pts_world, cam)
+
+    # Optional XY centering (camera-plane)
     if allow_xy_center:
-        tx, ty = cx, cy
-    else:
-        tx, ty = 0.0, 0.0
+        minx = min(p.x for p in cam_pts); maxx = max(p.x for p in cam_pts)
+        miny = min(p.y for p in cam_pts); maxy = max(p.y for p in cam_pts)
+        cx = (minx + maxx) * 0.5
+        cy = (miny + maxy) * 0.5
+        if abs(cx) > 1e-9 or abs(cy) > 1e-9:
+            right, up, _ = _cam_axes(cam)
+            cam.location += right * cx + up * cy
+            cam_pts = _to_cam_space(pts_world, cam)
 
-    # Determine required extra depth to fit all points with margin when centered.
-    needed_delta = 0.0
-    min_depth = float('inf')
+    # Compute current max normalized extent r_max
+    r_max = 0.0
+    r_argmax_depth = None
     for p in cam_pts:
-        # After shifting camera by (tx,ty), the relative point is (x' = x - tx, y' = y - ty, z' = z)
-        x = p.x - tx
-        y = p.y - ty
-        d = -p.z  # positive depth
-        min_depth = min(min_depth, d)
-        # For this point to be inside frustum at depth D: |x| <= D * tan_fx, |y| <= D * tan_fy
-        need_x = abs(x) / tan_fx if tan_fx > 1e-9 else 0.0
-        need_y = abs(y) / tan_fy if tan_fy > 1e-9 else 0.0
-        need = max(need_x, need_y)
-        delta = need - d
-        if delta > needed_delta:
-            needed_delta = delta
+        d = max(1e-9, -p.z)
+        rxn = abs(p.x) / (d * tanFx)
+        ryn = abs(p.y) / (d * tanFy)
+        r_here = max(rxn, ryn)
+        if r_here > r_max:
+            r_max = r_here
+            r_argmax_depth = d
 
-    # Apply margin to the depth increase
-    needed_delta = max(0.0, needed_delta) * margin
+    if r_max <= 0.0 or r_argmax_depth is None:
+        return
 
-    # Move camera in world space: +right*tx + up*ty + forward*needed_delta
-    q = cam.matrix_world.to_quaternion()
-    right = q @ mathutils.Vector((1,0,0))
-    up    = q @ mathutils.Vector((0,1,0))
-    forward = -(q @ mathutils.Vector((0,0,1)))  # camera looks along -Z in its local space
+    # Target coverage for margin m is r_target = 1/m
+    r_target = 1.0 / max(1.0, margin)
+    # If r_max < r_target, object is too small (too much margin) -> move camera forward
+    # If r_max > r_target, object is too large -> move camera back
+    s = r_target / r_max  # desired scaling of normalized extents
+    if abs(s - 1.0) < 1e-6:
+        if debug:
+            print(f"[UGC Fit PERSP] already tight (r_max={r_max:.4f}, target={r_target:.4f})")
+        return
 
-    if allow_xy_center and (abs(tx) > 1e-9 or abs(ty) > 1e-9):
-        cam.location += right * tx + up * ty
+    # Depth scales inversely with image size; want d' = d / s for the limiting point
+    d_star = r_argmax_depth
+    d_prime = d_star / s
+    t = d_star - d_prime  # positive => move forward by t; negative => move back by |t|
 
-    if needed_delta > 1e-12:
-        cam.location += forward * needed_delta
+    # Apply along local Z
+    _, _, fwd = _cam_axes(cam)
+    cam.location += fwd * t  # fwd is +forward; positive t = forward (tighten)
 
-    # Clip planes (keep near small but safe, far comfortably large)
-    new_near = max(0.001, (min_depth + needed_delta) * 0.1)
-    cam.data.clip_start = min(cam.data.clip_start, new_near) if cam.data.clip_start > 0 else new_near
-    cam.data.clip_end   = max(cam.data.clip_end, (min_depth + needed_delta) * 20.0)
+    if debug:
+        # Re-eval coverage
+        cam_pts2 = _to_cam_space(pts_world, cam)
+        r2 = 0.0
+        for p in cam_pts2:
+            d = max(1e-9, -p.z)
+            r2 = max(r2, abs(p.x)/(d*tanFx), abs(p.y)/(d*tanFy))
+        print(f"[UGC Fit PERSP] r_max_before={r_max:.4f}, r_max_after={r2:.4f}, target={r_target:.4f}, t={t:.6f}, margin={margin:.4f}")

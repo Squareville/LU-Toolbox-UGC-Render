@@ -1,7 +1,7 @@
 bl_info = {
     "name": "LU Toolbox UGC Render",
-    "author": "YourName",
-    "version": (1, 1, 0),
+    "author": "Christopher Fantauzzo",
+    "version": (1, 0, 0),
     "blender": (3, 1, 0),
     "location": "View3D > N-panel > LU UGC Render",
     "description": "Append UGC preset scene, link best LOD, fit camera (position only), and render.",
